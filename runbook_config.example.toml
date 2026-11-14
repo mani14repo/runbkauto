@@ -1,0 +1,69 @@
+# Parameters for RUNBOOK_MAINTENANCE_AUTOMATION_PROMPT.md
+# Copy to runbook_config.toml and edit. Windows paths: use single quotes (literal strings).
+
+app_name   = "PUMA Comp Engine"                    # <APP_NAME>
+app_short  = "PUMA"                                # used in Runbook IDs: RB-PUMA-04
+input_dir  = 'C:\path\to\puma\architecture-docs'   # <INPUT_DIR>
+code_repos = [                                     # <CODE_REPOS>
+  'C:\path\to\repos\puma-comp-engine',
+  'C:\path\to\repos\puma-infra',
+]
+ops_data   = [                                     # <OPS_DATA>  (optional; [] to skip)
+  # 'C:\path\to\servicenow\puma_incidents.csv',
+  # 'C:\path\to\servicenow\puma_problems.xlsx',
+]
+output_dir   = 'C:\path\to\runbook-output\puma\2026-11-12'   # <OUTPUT_DIR>, outside the repos
+owner_role   = "PUMA application support lead"               # <OWNER_ROLE>
+# previous_run = 'C:\path\to\runbook-output\puma\2026-08-01' # <PREVIOUS_RUN> for `maintain`
+
+# Optional
+# prompt_path    = 'C:\Users\rhari\OneDrive\Documents\CVSEvidenceLog\docs\docs\RUNBOOK_MAINTENANCE_AUTOMATION_PROMPT.md'
+# model          = "claude-opus-5-5"
+# effort         = "high"        # low | medium | high | xhigh | max
+# max_iterations = 150           # tool-call rounds per conversation
+# knowledge_articles = false     # also write ServiceNow KA HTML
+
+# --------------------------------------------------------------------------
+# LLM provider. Only the section matching `provider` is read.
+#   anthropic     Claude, first-party API      (ANTHROPIC_API_KEY or `ant auth login`)
+#   foundry       Claude on Microsoft Foundry  (Azure)
+#   bedrock       Claude on Amazon Bedrock
+#   vertex        Claude on Google Vertex AI
+#   azure_openai  Azure OpenAI deployment (GPT / o-series), via the OpenAI SDK
+# --------------------------------------------------------------------------
+provider = "anthropic"
+
+[foundry]
+resource = "my-foundry-resource"          # or base_url = "https://<resource>.services.ai.azure.com/anthropic"
+auth     = "api_key"                      # api_key (reads ANTHROPIC_FOUNDRY_API_KEY) | entra (DefaultAzureCredential)
+# scope  = "https://cognitiveservices.azure.com/.default"   # Entra token scope; confirm for your tenant
+# model is the Foundry deployment name; set top-level `model` if it isn't "claude-opus-5-5"
+
+[bedrock]
+aws_region  = "us-east-1"
+# aws_profile = "cvs-sso"                 # model gets the "anthropic." prefix automatically
+
+[vertex]
+project_id = "my-gcp-project"
+region     = "global"                     # needs: py -m pip install "anthropic[vertex]"
+
+[azure_openai]
+endpoint    = "https://my-resource.openai.azure.com"
+deployment  = "gpt-5-runbooks"            # your deployment name (used as the model)
+api_version = "2025-04-01-preview"        # an API version your resource supports
+auth        = "api_key"                   # api_key (reads AZURE_OPENAI_API_KEY) | entra
+# reasoning_model       = true            # false for non-reasoning deployments (e.g. gpt-4.1); drops reasoning_effort
+# reasoning_effort      = "high"          # low | medium | high (defaults to top-level effort)
+# max_completion_tokens = 32000
+# context_limit_tokens  = 200000          # older tool outputs are cleared above 75% of this
+# system_role           = "system"        # "developer" for deployments that require it
+
+# If the ServiceNow export uses unusual column names, map them here:
+# [ops_columns]
+# number = "Number"
+# short_description = "Short description"
+# ci = "Configuration item"
+# opened = "Opened"
+# close_code = "Resolution code"
+# close_notes = "Resolution notes"
+# problem = "Problem"

@@ -1,0 +1,11 @@
+anthropic>=2.8.0
+python-docx>=1.1
+python-pptx>=1.0
+openpyxl>=3.1
+pypdf>=5.0
+truststore>=0.9        # use the Windows certificate store (antivirus / proxy TLS inspection)
+
+# Optional, by provider:
+# openai>=2.0            # provider = azure_openai
+# azure-identity>=1.17   # auth = "entra" for foundry or azure_openai
+# anthropic[vertex]      # provider = vertex
