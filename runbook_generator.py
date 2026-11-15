@@ -32,16 +32,20 @@ import csv
 import datetime as dt
 import fnmatch
 import hashlib
+import io
 import json
 import os
+import posixpath
 import re
 import sys
 import time
 import tomllib
 from collections import defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
+
+import gh_source
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")  # type: ignore[attr-defined]
@@ -84,12 +88,13 @@ RUNBOOK_TYPES: list[tuple[int, str, str]] = [
 SKIP_DIRS = {
     ".git", ".svn", ".hg", "node_modules", ".venv", "venv", "env", "__pycache__",
     ".idea", ".vs", ".vscode", "bin", "obj", "dist", "build", "target", ".terraform",
-    ".gradle", ".mypy_cache", ".pytest_cache", ".tox", "coverage", ".next", "vendor",
+    ".gradle", ".mypy_cache", ".pytest_cache", ".tox", "coverage", ".next", "vendor", "site-packages",
 }
 SKIP_EXT = {
     ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".zip", ".gz", ".tar", ".7z",
     ".jar", ".war", ".ear", ".class", ".dll", ".exe", ".so", ".dylib", ".pyc", ".whl",
     ".mp4", ".mp3", ".woff", ".woff2", ".ttf", ".eot", ".lock", ".bin", ".pdb", ".nupkg",
+    ".map", ".bcmap", ".pyd", ".parquet", ".avro", ".onnx", ".pt", ".pkl", ".npy", ".h5",
 }
 EXTRACT_EXT = {".docx", ".pptx", ".xlsx", ".xlsm", ".pdf"}
 MAX_TEXT_BYTES = 5_000_000
@@ -143,6 +148,13 @@ class Config:
     provider: str = "anthropic"
     provider_opts: dict[str, Any] = field(default_factory=dict)
     exclude: list[str] = field(default_factory=list)
+    github_repos: list[str] = field(default_factory=list)   # owner/name[@ref], read through gh
+    github_host: str = "github.com"
+    github_signals: bool = True
+    github_alerts: bool = True
+    github_max_archive_mb: int = 2048
+    github_refresh: bool = False
+    skip_missing_repos: bool = False
 
     @property
     def app_id(self) -> str:
@@ -165,7 +177,7 @@ def load_config(args: argparse.Namespace) -> Config:
             data = tomllib.load(fh)
     for key in ("app_name", "input_dir", "code_repos", "ops_data", "output_dir",
                 "owner_role", "previous_run", "prompt_path", "app_short", "model",
-                "effort", "max_iterations", "provider"):
+                "effort", "max_iterations", "provider", "github_repos"):
         val = getattr(args, key, None)
         if val not in (None, [], ""):
             data[key] = val
@@ -195,6 +207,14 @@ def load_config(args: argparse.Namespace) -> Config:
         ops_columns=dict(data.get("ops_columns", {})),
         provider=str(data.get("provider", "anthropic")).lower(),
         exclude=[str(x) for x in data.get("exclude", [])],
+        github_repos=[str(x) for x in ([data["github_repos"]] if isinstance(data.get("github_repos"), str)
+                                       else data.get("github_repos", []))],
+        github_host=str(data.get("github_host", "github.com")).strip().lower(),
+        github_signals=bool(data.get("github_signals", True)),
+        github_alerts=bool(data.get("github_alerts", True)),
+        github_max_archive_mb=int(data.get("github_max_archive_mb", 2048)),
+        github_refresh=bool(getattr(args, "refresh_github", False)),
+        skip_missing_repos=bool(getattr(args, "skip_missing_repos", False)),
     )
     missing_repos = [r for r in cfg.code_repos if not r.is_dir()]
     if missing_repos and getattr(args, "skip_missing_repos", False):
@@ -221,6 +241,11 @@ def validate_config(cfg: Config, need_inputs: bool = True) -> None:
         for o in cfg.ops_data:
             if not o.exists():
                 errs.append(f"OPS_DATA not found: {o}")
+    for spec in cfg.github_repos:
+        try:
+            gh_source.parse_target(spec, cfg.github_host)
+        except gh_source.GitHubError as e:
+            errs.append(f"github_repos: {e}")
     if not cfg.prompt_path.is_file():
         errs.append(f"Prompt file not found: {cfg.prompt_path}")
     out = cfg.output_dir.resolve()
@@ -251,7 +276,9 @@ def render_prompt(cfg: Config) -> str:
         "<APP_NAME>": cfg.app_name,
         "<APP>": cfg.app_id,
         "<INPUT_DIR>": str(cfg.input_dir),
-        "<CODE_REPOS>": "; ".join(str(p) for p in cfg.code_repos) or (
+        "<CODE_REPOS>": "; ".join([str(p) for p in cfg.code_repos] + [
+            "{1}/{0} (GitHub, read through gh at one pinned commit; see github_refs.json)".format(
+                *gh_source.parse_target(s, cfg.github_host)[:2]) for s in cfg.github_repos]) or (
             "(none supplied: no code repositories are available for this run. Every fact that "
             "would come from code (pipelines, job definitions, alert rules, manifests, config, "
             "certificate references) must come from the documents or be recorded as a Gap, and "
@@ -276,37 +303,175 @@ def _slug(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-") or "root"
 
 
+class _Stat:
+    def __init__(self, size: int, mtime: float):
+        self.st_size, self.st_mtime = size, mtime
+
+
+class MemFile:
+    """A file of a GitHub repository held in memory. Offers the parts of Path the sandbox uses."""
+    __slots__ = ("root", "rel")
+
+    def __init__(self, root: gh_source.GhRepo, rel: str):
+        self.root, self.rel = root, rel
+
+    name = property(lambda self: PurePosixPath(self.rel).name)
+    suffix = property(lambda self: PurePosixPath(self.rel).suffix)
+
+    def is_file(self) -> bool:
+        return True
+
+    def is_dir(self) -> bool:
+        return False
+
+    def resolve(self) -> "MemFile":
+        return self
+
+    def read_bytes(self) -> bytes:
+        return self.root.files[self.rel]
+
+    def stat(self) -> _Stat:
+        return _Stat(len(self.root.files[self.rel]), self.root.mtime)
+
+    def is_relative_to(self, base: Any) -> bool:
+        if isinstance(base, MemFile):
+            return base == self
+        return (isinstance(base, MemDir) and base.root is self.root
+                and (not base.prefix or self.rel.startswith(base.prefix + "/")))
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, MemFile) and other.root is self.root and other.rel == self.rel
+
+    def __hash__(self) -> int:
+        return hash((id(self.root), self.rel))
+
+    def __str__(self) -> str:
+        return f"{self.root.label}/{self.rel}"
+
+
+class MemDir:
+    """A folder inside an in-memory GitHub repository (it may not exist; then nothing is under it)."""
+
+    def __init__(self, root: gh_source.GhRepo, prefix: str):
+        self.root, self.prefix = root, prefix
+
+    def is_file(self) -> bool:
+        return False
+
+    def is_dir(self) -> bool:
+        return True
+
+    def resolve(self) -> "MemDir":
+        return self
+
+
+# One download per repository per process; later phases reuse the commit pinned in OUTPUT_DIR/github_refs.json.
+_GH_CACHE: dict[str, gh_source.GhRepo] = {}
+GITHUB_REFS = "github_refs.json"
+
+
+def _keep_repo_file(rel: str, size: int) -> bool:
+    p = PurePosixPath(rel)
+    if any(d in SKIP_DIRS for d in p.parts[:-1]):
+        return False
+    ext = p.suffix.lower()
+    if ext in SKIP_EXT:
+        return False
+    return size <= (50_000_000 if ext in EXTRACT_EXT else MAX_TEXT_BYTES)
+
+
+def load_github(cfg: Config, spec: str) -> gh_source.GhRepo:
+    if spec in _GH_CACHE:
+        return _GH_CACHE[spec]
+    refs_path = cfg.output_dir / GITHUB_REFS
+    pins = {}
+    if refs_path.is_file():
+        try:
+            pins = json.loads(refs_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            pins = {}
+    pinned = None if cfg.github_refresh else (pins.get(spec) or {}).get("sha")
+    repo = gh_source.fetch(spec, _keep_repo_file, host=cfg.github_host, sha=pinned, signals=cfg.github_signals,
+                           alerts=cfg.github_alerts, max_archive_mb=cfg.github_max_archive_mb)
+    if pins.get(spec, {}).get("sha") not in (None, repo.sha):
+        print(f"  ! {repo.repository}: moved from pinned {pins[spec]['sha'][:12]} to {repo.sha[:12]} (--refresh-github)")
+    print(f"  ✓ {repo.label}: {len(repo.files)} files ({repo.fetch}), {repo.skipped} left out by type or size"
+          + (f"; {len(repo.notes)} note(s)" if repo.notes else ""))
+    pins[spec] = repo.pin()
+    cfg.output_dir.mkdir(parents=True, exist_ok=True)
+    refs_path.write_text(json.dumps(pins, indent=2, sort_keys=True), encoding="utf-8")
+    _GH_CACHE[spec] = repo
+    return repo
+
+
+def _github_failed(cfg: Config, spec: str, err: Exception) -> None:
+    msg = f"GitHub repository {spec}: {err}"
+    if cfg.skip_missing_repos:
+        print(f"  ! skipping {msg}")
+        return
+    hint = ""
+    if isinstance(err, gh_source.GitHubError) and "cannot read it" in str(err):
+        hint = ("\n  Sign gh in with an account that can read it (`gh auth login`, or `gh auth switch` if you have "
+                "several), and if the organization uses SAML SSO authorize gh for it. Run `github-check` to test "
+                "access, or pass --skip-missing-repos.")
+    sys.exit(msg + hint)
+
+
 class Sandbox:
-    """Maps short aliases (docs/, <repo-name>/, ops/, prev/) to real paths."""
+    """Maps short aliases (docs/, <repo-name>/, ops/, prev/) to real paths or in-memory GitHub repositories."""
 
     def __init__(self, cfg: Config, include_prev: bool = False):
         self.cfg = cfg
-        self.roots: dict[str, Path] = {}
+        self.roots: dict[str, Any] = {}       # Path, or gh_source.GhRepo for a repository read through gh
         self.kinds: dict[str, str] = {}
+        self._alias_of: dict[int, str] = {}
         self._add("docs", cfg.input_dir, "documents")
         for r in cfg.code_repos:
             self._add(_slug(r.name), r, "code repository")
+        if cfg.github_repos:
+            account = None
+            try:
+                account = gh_source.check_auth(cfg.github_host)
+            except gh_source.GitHubError as e:
+                sys.exit(str(e))
+            print(f"Reading {len(cfg.github_repos)} GitHub repositor{'y' if len(cfg.github_repos) == 1 else 'ies'} "
+                  f"through gh as {account} on {cfg.github_host}…")
+            for spec in cfg.github_repos:
+                try:
+                    repo = load_github(cfg, spec)
+                except gh_source.GitHubError as e:
+                    _github_failed(cfg, spec, e)
+                    continue
+                self._add(_slug(repo.name), repo, f"code repository (GitHub via gh, commit {repo.label})")
         for o in cfg.ops_data:
             self._add("ops" if o.is_dir() else f"ops-{_slug(o.stem)}", o, "ops data")
         if include_prev and cfg.previous_run:
             self._add("prev", cfg.previous_run, "previous run (read-only)")
         self.out = cfg.output_dir.resolve()
-        self._extract_cache: dict[Path, list[str]] = {}
+        self._extract_cache: dict[Any, list[str]] = {}
 
-    def _add(self, alias: str, path: Path, kind: str) -> None:
+    def _add(self, alias: str, path: Any, kind: str) -> None:
         a, n = alias, 2
         while a in self.roots:
             a, n = f"{alias}-{n}", n + 1
-        self.roots[a] = path.resolve()
+        self.roots[a] = path if isinstance(path, gh_source.GhRepo) else path.resolve()
         self.kinds[a] = kind
+        self._alias_of[id(self.roots[a])] = a
 
     # -- resolution ---------------------------------------------------------
-    def resolve(self, vpath: str) -> Path:
+    def resolve(self, vpath: str) -> Any:
         vpath = vpath.replace("\\", "/").strip().lstrip("/")
         alias, _, rest = vpath.partition("/")
         if alias not in self.roots:
             raise ValueError(f"Unknown root '{alias}'. Valid roots: {', '.join(self.roots)}")
         root = self.roots[alias]
+        if isinstance(root, gh_source.GhRepo):
+            rel = posixpath.normpath(rest.strip("/")) if rest.strip("/") else ""
+            if rel == ".":
+                rel = ""
+            if rel.startswith("../") or rel == "..":
+                raise ValueError("Path escapes its root")
+            return MemFile(root, rel) if rel in root.files else MemDir(root, rel)
         if root.is_file():
             if rest:
                 raise ValueError(f"'{alias}' is a single file; use just '{alias}'")
@@ -318,7 +483,9 @@ class Sandbox:
             raise ValueError("Use the output tools for OUTPUT_DIR")
         return p
 
-    def virtual(self, real: Path) -> str:
+    def virtual(self, real: Any) -> str:
+        if isinstance(real, MemFile):
+            return f"{self._alias_of.get(id(real.root), real.root.name)}/{real.rel}"
         real = real.resolve()
         for alias, root in self.roots.items():
             if real == root:
@@ -332,6 +499,16 @@ class Sandbox:
         roots = [alias] if alias else list(self.roots)
         for a in roots:
             root = self.roots[a]
+            if isinstance(root, gh_source.GhRepo):
+                for rel in sorted(root.files):
+                    f = MemFile(root, rel)
+                    if f.suffix.lower() in SKIP_EXT:
+                        continue
+                    if self.cfg.exclude and any(fnmatch.fnmatch(f"{a}/{rel}", pat) or fnmatch.fnmatch(f.name, pat)
+                                                for pat in self.cfg.exclude):
+                        continue
+                    yield f
+                continue
             if root.is_file():
                 yield root
                 continue
@@ -353,6 +530,8 @@ class Sandbox:
     def lines(self, p: Path) -> list[str]:
         if p in self._extract_cache:
             return self._extract_cache[p]
+        if not p.is_file():
+            raise ValueError("Not a file (use list_files to see what is there)")
         ext = p.suffix.lower()
         if ext in EXTRACT_EXT:
             out = extract_document(p)
@@ -368,13 +547,15 @@ class Sandbox:
         return out
 
 
-def extract_document(p: Path) -> list[str]:
+def extract_document(p: Any) -> list[str]:
     ext = p.suffix.lower()
     lines: list[str] = []
+    if isinstance(p, MemFile):          # the libraries all read from a file object as well as a path
+        p = io.BytesIO(p.read_bytes())
     try:
         if ext == ".docx":
             import docx  # python-docx
-            d = docx.Document(str(p))
+            d = docx.Document(p if isinstance(p, io.BytesIO) else str(p))
             body = d.element.body
             for child in body.iterchildren():
                 tag = child.tag.rsplit("}", 1)[-1]
@@ -392,7 +573,7 @@ def extract_document(p: Path) -> list[str]:
                         lines.append("| " + " | ".join(c.text.strip().replace("\n", " ") for c in row.cells) + " |")
         elif ext == ".pptx":
             from pptx import Presentation
-            prs = Presentation(str(p))
+            prs = Presentation(p if isinstance(p, io.BytesIO) else str(p))
             for i, slide in enumerate(prs.slides, 1):
                 lines.append(f"--- Slide {i} ---")
                 for shape in slide.shapes:
@@ -410,7 +591,7 @@ def extract_document(p: Path) -> list[str]:
                         lines.append(f"[Speaker notes] {notes}")
         elif ext in (".xlsx", ".xlsm"):
             import openpyxl
-            wb = openpyxl.load_workbook(str(p), read_only=True, data_only=True)
+            wb = openpyxl.load_workbook(p if isinstance(p, io.BytesIO) else str(p), read_only=True, data_only=True)
             for ws in wb.worksheets:
                 lines.append(f"--- Sheet {ws.title} ---")
                 for row in ws.iter_rows(values_only=True):
@@ -419,7 +600,7 @@ def extract_document(p: Path) -> list[str]:
             wb.close()
         elif ext == ".pdf":
             from pypdf import PdfReader
-            reader = PdfReader(str(p))
+            reader = PdfReader(p if isinstance(p, io.BytesIO) else str(p))
             for i, page in enumerate(reader.pages, 1):
                 lines.append(f"--- Page {i} ---")
                 lines.extend((page.extract_text() or "").splitlines())
@@ -432,7 +613,9 @@ def extract_document(p: Path) -> list[str]:
 # Source inventory + hashes (deterministic; feeds SOURCES.md and maintenance)
 # --------------------------------------------------------------------------- #
 
-def sha256_file(p: Path) -> str:
+def sha256_file(p: Any) -> str:
+    if isinstance(p, MemFile):
+        return hashlib.sha256(p.read_bytes()).hexdigest()
     h = hashlib.sha256()
     with open(p, "rb") as fh:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
@@ -830,6 +1013,10 @@ def make_tools(sb: Sandbox, cfg: Config, log: RunLog, verbose: bool):
             raise ValueError("Path escapes OUTPUT_DIR")
         return p
 
+    def _program_owned(p: Path) -> bool:
+        rel = p.relative_to(out_root)
+        return rel.as_posix() in PROGRAM_FILES or (rel.parts and rel.parts[0] == "logs")
+
     @beta_tool
     def write_output(relative_path: str, content: str, append: bool = False) -> str:
         """Write a file under OUTPUT_DIR (the only place you may write).
@@ -845,6 +1032,10 @@ def make_tools(sb: Sandbox, cfg: Config, log: RunLog, verbose: bool):
         """
         try:
             p = _out_path(relative_path)
+            if _program_owned(p):
+                note("write_output", path=relative_path, refused="program-owned file")
+                return (f"REFUSED, nothing written: {relative_path} is written by the program, not by you "
+                        "(SOURCES.md, sources.json, runbooks.json, github_refs.json, generated_manifest.json, logs/)")
             block, warn = scan_text(content)
             if block:
                 note("write_output", path=relative_path, refused=block)
@@ -895,6 +1086,8 @@ def make_tools(sb: Sandbox, cfg: Config, log: RunLog, verbose: bool):
 # --------------------------------------------------------------------------- #
 # Claude conversation
 # --------------------------------------------------------------------------- #
+
+PROGRAM_FILES = {"SOURCES.md", "sources.json", "runbooks.json", "generated_manifest.json", GITHUB_REFS}
 
 HARNESS = """\
 # Harness notes (from the runbook generator program)
@@ -1498,7 +1691,7 @@ def cmd_check(cfg: Config, args: argparse.Namespace) -> int:
     for f in out.rglob("*"):
         if not f.is_file() or "logs" in f.parts or f.suffix not in (".md", ".json", ".html"):
             continue
-        if f.name in ("SOURCES.md", "sources.json", "generated_manifest.json", "PROMPT_FILLED.md"):
+        if f.name in ("SOURCES.md", "sources.json", "generated_manifest.json", "PROMPT_FILLED.md", GITHUB_REFS):
             continue
         block, warn = scan_text(f.read_text(encoding="utf-8", errors="replace"))
         rel = f.relative_to(out).as_posix()
@@ -1522,6 +1715,41 @@ def cmd_check(cfg: Config, args: argparse.Namespace) -> int:
     return 1 if problems else 0
 
 
+def cmd_github_check(cfg: Config, args: argparse.Namespace) -> int:
+    """Check gh's sign-in and access to each github_repos entry. Reads repository metadata only; downloads nothing."""
+    if not cfg.github_repos:
+        print("No github_repos in the config.")
+        return 0
+    try:
+        account = gh_source.check_auth(cfg.github_host)
+    except gh_source.GitHubError as e:
+        print(f"✗ {e}")
+        return 1
+    print(f"gh is signed in to {cfg.github_host} as {account}\n")
+    pins = {}
+    refs = cfg.output_dir / GITHUB_REFS
+    if refs.is_file():
+        pins = json.loads(refs.read_text(encoding="utf-8"))
+    bad = 0
+    for spec in cfg.github_repos:
+        repo, host, ref = gh_source.parse_target(spec, cfg.github_host)
+        gh = gh_source.Gh(host)
+        try:
+            m = gh.api(f"repos/{repo}") or {}
+            pin = (pins.get(spec) or {}).get("sha", "")
+            print(f"✓ {m.get('full_name', repo):45} {ref or m.get('default_branch', '?'):12} "
+                  f"{int(m.get('size') or 0) // 1024:>6} MB  {'archived ' if m.get('archived') else ''}"
+                  f"{'pinned ' + pin[:12] if pin else 'not pinned yet'}")
+        except gh_source.GhApiError as e:
+            bad += 1
+            why = "not found, or this account cannot read it" if e.http in (403, 404) else str(e)
+            print(f"✗ {repo:45} {why}")
+    if bad:
+        print(f"\n{bad} of {len(cfg.github_repos)} not readable as {account}. Sign gh in with an account that can read "
+              "them (`gh auth login`, or `gh auth switch`), and if the organization uses SAML SSO, authorize gh for it.")
+    return 1 if bad else 0
+
+
 def cmd_all(cfg: Config, args: argparse.Namespace) -> int:
     if not args.skip_review:
         sys.exit("`all` skips the Phase 0 SME review stop. Pass --skip-review to confirm, "
@@ -1541,13 +1769,15 @@ def build_parser() -> argparse.ArgumentParser:
         description="Generate and maintain evidence-cited runbooks with Claude, "
                     "from RUNBOOK_MAINTENANCE_AUTOMATION_PROMPT.md.")
     ap.add_argument("command", choices=["render", "inventory", "draft", "finalize", "check",
-                                        "maintain", "all"])
+                                        "maintain", "all", "github-check"])
     ap.add_argument("-c", "--config", help="TOML config file with the prompt parameters")
     g = ap.add_argument_group("prompt parameters (override the config file)")
     g.add_argument("--app-name", dest="app_name")
     g.add_argument("--app-short", dest="app_short", help="Short ID used in RB-<APP>-<NN>")
     g.add_argument("--input-dir", dest="input_dir")
     g.add_argument("--code-repo", dest="code_repos", action="append", help="Repeat per repository")
+    g.add_argument("--github-repo", dest="github_repos", action="append",
+                   help="owner/name[@ref] read through gh instead of a local clone; repeatable")
     g.add_argument("--ops-data", dest="ops_data", action="append", help="CSV/XLSX file or folder; repeatable")
     g.add_argument("--output-dir", dest="output_dir")
     g.add_argument("--owner-role", dest="owner_role")
@@ -1569,6 +1799,8 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--skip-review", action="store_true", help="Allow `all` to skip the Phase 0 review stop")
     r.add_argument("--skip-missing-repos", action="store_true",
                    help="Run with the code repos that exist instead of failing on missing ones")
+    r.add_argument("--refresh-github", dest="refresh_github", action="store_true",
+                   help="Read the latest commit of each GitHub repository instead of the one pinned in github_refs.json")
     r.add_argument("-v", "--verbose", action="store_true", help="Print every tool call")
     return ap
 
@@ -1599,17 +1831,40 @@ def _root_cause(e: BaseException) -> str:
     return msg
 
 
+def check_provider_sdk(cfg: Config) -> None:
+    """Fail before any download if the provider's SDK isn't in this Python."""
+    import importlib.util
+    need = ["openai"] if cfg.provider == "azure_openai" else ["anthropic"]
+    if str((getattr(cfg, "provider_opts", None) or {}).get("auth", "api_key")).lower() == "entra":
+        need.append("azure.identity")
+
+    def present(m: str) -> bool:
+        try:
+            return importlib.util.find_spec(m) is not None
+        except ModuleNotFoundError:
+            return False
+    missing = [m for m in need if not present(m)]
+    if missing:
+        pkgs = " ".join({"azure.identity": "azure-identity"}.get(m, m) for m in missing)
+        sys.exit(f"provider = {cfg.provider!r} needs {', '.join(missing)}, which this Python "
+                 f"({sys.executable}) doesn't have.\nInstall it with:\n"
+                 f"  \"{sys.executable}\" -m pip install {pkgs}")
+
+
 def main(argv: list[str] | None = None) -> int:
     use_os_trust_store()
     args = build_parser().parse_args(argv)
     cfg = load_config(args)
-    validate_config(cfg, need_inputs=args.command not in ("render", "check"))
+    validate_config(cfg, need_inputs=args.command not in ("render", "check", "github-check"))
+    if args.command not in ("render", "check", "github-check"):
+        check_provider_sdk(cfg)
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
-    if args.command not in ("render", "check") and cfg.provider == "anthropic" and not (
+    if args.command not in ("render", "check", "github-check") and cfg.provider == "anthropic" and not (
             os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")):
         print("Note: ANTHROPIC_API_KEY is not set; relying on an `ant auth login` profile if present.")
     handlers = {"render": cmd_render, "inventory": cmd_inventory, "draft": cmd_draft,
-                "finalize": cmd_finalize, "check": cmd_check, "maintain": cmd_maintain, "all": cmd_all}
+                "finalize": cmd_finalize, "check": cmd_check, "maintain": cmd_maintain, "all": cmd_all,
+                "github-check": cmd_github_check}
     rc = handlers[args.command](cfg, args)
     return int(rc or 0)
 

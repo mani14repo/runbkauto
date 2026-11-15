@@ -8,6 +8,12 @@ code_repos = [                                     # <CODE_REPOS>
   'C:\path\to\repos\puma-comp-engine',
   'C:\path\to\repos\puma-infra',
 ]
+# Or read repositories straight from GitHub through the gh CLI (no clone), at one pinned commit:
+# github_repos = ["my-org/puma-comp-engine", "my-org/puma-infra@release/2026.11"]
+# github_host  = "github.com"        # or your GitHub Enterprise host
+# github_signals = true              # add _github/repository-signals.md (branch protection, environments, releases, deployments)
+# github_alerts  = true              # add _github/security-alerts.md (Dependabot, code scanning, secret scanning; never secret values)
+# github_max_archive_mb = 2048       # the archive is streamed; bigger ones are read file by file
 ops_data   = [                                     # <OPS_DATA>  (optional; [] to skip)
   # 'C:\path\to\servicenow\puma_incidents.csv',
   # 'C:\path\to\servicenow\puma_problems.xlsx',

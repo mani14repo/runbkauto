@@ -1,3 +1,6 @@
 runbook_config.toml
+runbook_config.*.toml
+!runbook_config.example.toml
 PUMA_Docs/
+HELIX_Docs/
 __pycache__/
